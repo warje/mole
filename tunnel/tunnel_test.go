@@ -200,6 +200,33 @@ func TestTunnelMultipleDestinations(t *testing.T) {
 	tun.Stop()
 }
 
+func TestTunnelUnreachableDestination(t *testing.T) {
+	c := &tunnelConfig{t, "local", 2, false, NoSshRetries}
+	tun, _, hss := prepareTunnel(c)
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	hss[0].Close()
+
+	client := http.Client{Timeout: 500 * time.Millisecond}
+	if _, err := client.Get(fmt.Sprintf("http://%s/ABC", tun.channels[0].listener.Addr())); err == nil {
+		t.Errorf("expected request to a closed destination to fail")
+	}
+
+	live := &Tunnel{channels: tun.channels[1:]}
+	if err := validateTunnelConnectivity(t, "DEF", live); err != nil {
+		t.Errorf("other channels must keep working after a destination is unreachable: %v", err)
+	}
+
+	tun.Stop()
+}
+
 func TestReconnectSSHServer(t *testing.T) {
 	c := &tunnelConfig{t, "local", 1, false, 3}
 	tun, ssh, _ := prepareTunnel(c)
@@ -449,7 +476,7 @@ func prepareTunnel(config *tunnelConfig) (tun *Tunnel, ssh net.Listener, hss []*
 			config.T.Errorf("could not configure destination endpoints for testing: %v\n", err)
 			return
 		}
-		hss = append(hss, hs)
+		hss[i] = hs
 	}
 
 	tun, _ = New(config.TunnelType, srv, source, destination, configPath)
@@ -652,8 +679,13 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 						remoteIP := string(payload[pad : pad+l])
 						remotePort := binary.BigEndian.Uint32(payload[pad+l : pad+l+4])
 
+						remoteConn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", remoteIP, remotePort))
+						if err != nil {
+							newChan.Reject(ssh.ConnectionFailed, err.Error())
+							return
+						}
+
 						conn, _, _ := newChan.Accept()
-						remoteConn, _ := net.Dial("tcp", fmt.Sprintf("%s:%d", remoteIP, remotePort))
 
 						go func() {
 							io.Copy(conn, remoteConn)
