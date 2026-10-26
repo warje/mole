@@ -1,6 +1,8 @@
 package tunnel
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -306,8 +308,11 @@ func (t *Tunnel) startChannel(channel *SSHChannel) error {
 		return fmt.Errorf("unknown tunnel type %s", t.Type)
 	}
 
+	// A destination that is down must only drop this connection, not every channel.
 	if err != nil {
-		return fmt.Errorf("dial error: %s", err)
+		channel.conn.Close()
+		log.WithError(err).WithField("channel", channel).Warn("could not reach destination")
+		return nil
 	}
 
 	go copyConn(channel.conn, destinationConn)
@@ -513,9 +518,57 @@ func sshClientConfig(server Server) (*ssh.ClientConfig, error) {
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signers...),
 		},
-		HostKeyCallback: clb,
-		Timeout:         server.Timeout,
+		HostKeyCallback:   clb,
+		HostKeyAlgorithms: knownHostKeyAlgorithms(clb, server.Address),
+		Timeout:           server.Timeout,
 	}, nil
+}
+
+// knownHostKeyAlgorithms returns the host key algorithms that known_hosts holds
+// for addr, so the server is asked for a key type that can be verified.
+// It returns nil, which keeps the library defaults, when the host is unknown.
+func knownHostKeyAlgorithms(clb ssh.HostKeyCallback, addr string) []string {
+	remote, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil
+	}
+
+	// A throwaway key never matches, so the callback reports which keys it knows.
+	_, probe, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil
+	}
+
+	probeKey, err := ssh.NewPublicKey(probe.Public())
+	if err != nil {
+		return nil
+	}
+
+	var keyErr *knownhosts.KeyError
+	if !errors.As(clb(addr, remote, probeKey), &keyErr) {
+		return nil
+	}
+
+	var algos []string
+	seen := map[string]bool{}
+	for _, k := range keyErr.Want {
+		for _, a := range algorithmsForKeyType(k.Key.Type()) {
+			if !seen[a] {
+				seen[a] = true
+				algos = append(algos, a)
+			}
+		}
+	}
+
+	return algos
+}
+
+func algorithmsForKeyType(keyType string) []string {
+	if keyType == ssh.KeyAlgoRSA {
+		return []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	}
+
+	return []string{keyType}
 }
 
 func copyConn(writer, reader net.Conn) {
