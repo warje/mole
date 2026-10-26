@@ -2,6 +2,7 @@ package mole
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 )
@@ -10,7 +11,7 @@ const (
 	AddressFormat = "%s:%s"
 )
 
-var re = regexp.MustCompile(`(?P<user>.+@)?(?P<host>[[:alpha:][:digit:]\_\-\.]+)?(?P<port>:[0-9]+)?`)
+var re = regexp.MustCompile(`(?P<user>.+@)?(?P<host>\[[[:xdigit:]:.]+(?:%[[:alnum:]\_\-\.]+)?\]|[[:alpha:][:digit:]\_\-\.]+)?(?P<port>:[0-9]+)?`)
 
 // AddressInput holds information about a host
 type AddressInput struct {
@@ -35,7 +36,7 @@ func (ai AddressInput) String() string {
 func (ai *AddressInput) Set(value string) error {
 	result := parseServerInput(value)
 	ai.User = strings.Trim(result["user"], "@")
-	ai.Host = result["host"]
+	ai.Host = strings.Trim(result["host"], "[]")
 	ai.Port = strings.Trim(result["port"], ":")
 
 	return nil
@@ -53,7 +54,7 @@ func (ai AddressInput) Address() string {
 		return ai.Host
 	}
 
-	return fmt.Sprintf(AddressFormat, ai.Host, ai.Port)
+	return net.JoinHostPort(ai.Host, ai.Port)
 }
 
 func parseServerInput(input string) map[string]string {

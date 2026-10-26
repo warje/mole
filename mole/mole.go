@@ -475,7 +475,8 @@ func createTunnel(conf *Configuration) (*tunnel.Tunnel, error) {
 	destination := make([]string, len(conf.Destination))
 	for i, r := range conf.Destination {
 		if r.Port == "" {
-			log.WithError(err).Errorf("missing port in destination address: %s", r.String())
+			err = fmt.Errorf("missing port in destination address: %s", r.String())
+			log.Error(err)
 			return nil, err
 		}
 

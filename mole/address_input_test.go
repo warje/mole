@@ -76,6 +76,11 @@ func TestAddressInputAddress(t *testing.T) {
 			"",
 			"mole-server",
 		},
+		{
+			"::1",
+			"4500",
+			"[::1]:4500",
+		},
 	}
 
 	for id, test := range tests {
@@ -84,6 +89,29 @@ func TestAddressInputAddress(t *testing.T) {
 
 		if test.expected != addr {
 			t.Errorf("address does not match on test %d: expected: %s, value: %s", id, test.expected, addr)
+		}
+	}
+}
+
+func TestAddressInputSetIPv6(t *testing.T) {
+	tests := []struct {
+		input string
+		user  string
+		host  string
+		port  string
+	}{
+		{"[::1]:4500", "", "::1", "4500"},
+		{"mole@[fe80::1%eth0]:22", "mole", "fe80::1%eth0", "22"},
+		{"127.0.0.1:3001", "", "127.0.0.1", "3001"},
+		{":3001", "", "", "3001"},
+	}
+
+	for id, test := range tests {
+		var ai mole.AddressInput
+		ai.Set(test.input)
+
+		if ai.User != test.user || ai.Host != test.host || ai.Port != test.port {
+			t.Errorf("test %d: expected: %q %q %q, value: %q %q %q", id, test.user, test.host, test.port, ai.User, ai.Host, ai.Port)
 		}
 	}
 }
