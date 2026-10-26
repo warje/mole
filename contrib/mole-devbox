@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Forward every TCP port a remote host listens on to the same port on localhost, using mole.
+# Written for bash 3.2 so it runs on stock macOS.
+set -euo pipefail
+
+MOLE=${MOLE:-mole}
+interval=10
+skip=",5355,9091,9100,"
+only=""
+ssh_config=""
+dry_run=0
+
+usage() {
+	cat <<'EOF'
+Usage: mole-devbox [-i seconds] [-x ports] [-p ports] [-F ssh_config] [-n] <ssh-host>
+
+Forwards each TCP port that <ssh-host> listens on (loopback or wildcard, 1024-32767)
+to the same port on 127.0.0.1. Re-scans every -i seconds and restarts mole when the
+set of ports changes, so new services show up without editing ~/.ssh/config.
+
+  -i seconds    rescan interval, 0 scans once (default 10)
+  -x ports      extra ports to skip, comma separated (always skipped: 5355,9091,9100)
+  -p ports      forward only these ports, comma separated, no scan
+  -F file       ssh config file to resolve <ssh-host> with
+  -n            print the mole command and exit
+
+Environment: MOLE overrides the mole binary path.
+EOF
+}
+
+log() { printf '%s mole-devbox: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+while getopts ':i:x:p:F:nh' opt; do
+	case $opt in
+	i) interval=$OPTARG ;;
+	x) skip="$skip$OPTARG," ;;
+	p) only=",$OPTARG," ;;
+	F) ssh_config=$OPTARG ;;
+	n) dry_run=1 ;;
+	h) usage; exit 0 ;;
+	*) usage >&2; exit 2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+host=$1
+
+ssh_cmd() {
+	if [ -n "$ssh_config" ]; then ssh -F "$ssh_config" "$@"; else ssh "$@"; fi
+}
+
+command -v "$MOLE" >/dev/null || die "mole not found; set MOLE or put it on PATH"
+
+# mole has no ProxyJump/ProxyCommand support and only a partial ssh_config parser,
+# so resolve the host with ssh itself and hand mole plain values.
+ssh_g=$(ssh_cmd -G "$host") || die "ssh -G $host failed"
+get() { printf '%s\n' "$ssh_g" | awk -v k="$1" '$1 == k { sub(/^[^ ]+ /, ""); print; exit }'; }
+
+for k in proxyjump proxycommand; do
+	v=$(get "$k")
+	[ -z "$v" ] || [ "$v" = none ] || die "$host uses $k, which mole does not support"
+done
+server="$(get user)@$(get hostname):$(get port)"
+
+key=""
+while IFS= read -r f; do
+	f=${f/#\~/$HOME}
+	if [ -f "$f" ]; then key=$f; break; fi
+done <<EOF
+$(printf '%s\n' "$ssh_g" | awk '$1 == "identityfile" { sub(/^[^ ]+ /, ""); print }')
+EOF
+[ -n "$key" ] || die "no IdentityFile for $host exists on disk; mole needs a private key file"
+
+agent=$(get identityagent)
+case $agent in "" | none | SSH_AUTH_SOCK | '$SSH_AUTH_SOCK') agent=${SSH_AUTH_SOCK:-} ;; esac
+agent=${agent/#\~/$HOME}
+agent=${agent#\"}; agent=${agent%\"}
+
+# Prints "<port> <destination host>" per forwardable listener, preferring 127.0.0.1 over [::1].
+scan() {
+	if [ -n "$only" ]; then
+		printf '%s\n' "$only" | tr ',' '\n' | awk 'NF { print $1, "127.0.0.1" }' | sort -n
+		return
+	fi
+	ssh_cmd -T -o BatchMode=yes -o ConnectTimeout=5 "$host" 'ss -ltnH' | awk -v skip="$skip" '
+		{
+			a = $4
+			if (!match(a, /:[0-9]+$/)) next
+			p = substr(a, RSTART + 1) + 0
+			h = substr(a, 1, RSTART - 1)
+			if (h == "127.0.0.1" || h == "0.0.0.0" || h == "*" || h == "[::]") d = "127.0.0.1"
+			else if (h == "[::1]") d = "[::1]"
+			else next
+			if (p < 1024 || p > 32767 || index(skip, "," p ",")) next
+			if (!(p in m) || d == "127.0.0.1") m[p] = d
+		}
+		END { for (p in m) print p, m[p] }' | sort -n
+}
+
+local_busy() {
+	if command -v lsof >/dev/null; then
+		lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
+	else
+		(exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+	fi
+}
+
+pid=""
+stop_mole() {
+	if [ -n "$pid" ]; then
+		kill "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
+		pid=""
+	fi
+}
+trap stop_mole EXIT
+trap 'exit 130' INT TERM
+
+start_mole() {
+	stop_mole
+	local args=() ports="" busy="" p d
+	while read -r p d; do
+		[ -n "$p" ] || continue
+		if local_busy "$p"; then busy="$busy $p"; continue; fi
+		args+=(-S "127.0.0.1:$p" -d "$d:$p")
+		ports="$ports $p"
+	done <<EOF
+$1
+EOF
+	[ -z "$busy" ] || log "skipped, already in use locally:$busy"
+	if [ ${#args[@]} -eq 0 ]; then
+		log "no ports to forward from $host"
+		return
+	fi
+	local cmd=("$MOLE" start local -c /dev/null -s "$server" -k "$key" -R 0)
+	[ -z "$agent" ] || cmd+=(-A "$agent")
+	cmd+=("${args[@]}")
+	if [ "$dry_run" -eq 1 ]; then
+		printf '%q ' "${cmd[@]}"; echo
+		exit 0
+	fi
+	log "forwarding$ports"
+	"${cmd[@]}" &
+	pid=$!
+}
+
+current="<none>"
+while :; do
+	if found=$(scan); then
+		if [ "$found" != "$current" ] || { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; }; then
+			current=$found
+			start_mole "$found"
+		fi
+	else
+		log "scan of $host failed; keeping current tunnels"
+	fi
+	if [ "$interval" = 0 ]; then
+		[ -z "$pid" ] || wait "$pid"
+		break
+	fi
+	sleep "$interval"
+done
